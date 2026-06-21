@@ -1,0 +1,25 @@
+# Project data — input photos and generated collages
+pics/
+output/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# rembg downloaded models
+.u2net/
+
+# OS / editor cruft
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+CLAUDE.md
