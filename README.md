@@ -6,11 +6,12 @@ Drop your photos in `pics/`, run the script, get a collage in `output/`.
 
 ## Features
 
-- **Subject-aware layout.** Each photo gets a cell sized to fit its subject, so a wide two-person photo is never sliced down to one face.
+- **Face-aware layout & cropping.** Faces are detected (InsightFace SCRFD) and drive both how cells are shaped and how each photo is cropped, so faces are never sliced at a seam and a wide group photo gets a wide cell. Background-crowd faces are filtered out using the cutout, so framing stays on the people the photo is about.
+- **Color cohesion.** All photos are graded toward one shared look, so a set shot in mixed lighting feels like one cohesive piece instead of a random pile.
 - **Layered, overlapping look.** Photos overlap slightly with clean hard edges, like printed pictures stacked on a table.
 - **No subject ever covered.** Overlaps are composited so an overlapping photo reveals the subject beneath it instead of hiding it.
-- **One tasteful 3D pop.** A single clean subject is cut from its background and lifted on top with a soft shadow, picked so it never covers another face.
-- **Fully local.** Background removal runs on your machine via [rembg](https://github.com/danielgatis/rembg). No accounts, no API keys, no uploads.
+- **Tasteful 3D pops.** Clean subjects are cut from their background and lifted on top with a soft shadow. It's quality-gated, not a fixed count: a set with no standout pops nothing, a set with several great subjects pops a few (favoring people, never covering a face, never clustering).
+- **Fully local.** Background removal and face detection run on your machine ([rembg](https://github.com/danielgatis/rembg), [InsightFace](https://github.com/deepinsight/insightface)). No accounts, no API keys, no uploads.
 
 ## Setup
 
@@ -18,7 +19,7 @@ Drop your photos in `pics/`, run the script, get a collage in `output/`.
 pip install -r requirements.txt
 ```
 
-Dependencies are Pillow and `rembg[cpu]` (which pulls in `onnxruntime`). The first run downloads the segmentation model (~224 MB) once, then works offline. Use `--no-cutout` to skip the AI step entirely.
+Dependencies are Pillow, `rembg[cpu]`, and `insightface` (which also brings in `onnxruntime` and OpenCV). The first run downloads the segmentation model (~224 MB) and a small face-detection model pack once, then works offline. Use `--no-cutout`, `--no-faces`, or `--no-color` to skip individual AI steps.
 
 ## Usage
 
@@ -39,9 +40,13 @@ This reads everything in `pics/` and writes `output/collage.jpg`, sized 1080x192
 | `--ratio W:H` | `9:16` | Canvas aspect ratio, e.g. `4:5`, `3:4`, `9:16`. |
 | `--overlap F` | `1.1` | How much each photo oversizes its cell so neighbors overlap (`1.0` = no overlap). |
 | `--scatter F` | `0.15` | How much photos are jittered off the grid, `0`-`1`. |
-| `--pop N` | `1` | Max number of subjects lifted out over neighbors (`0` = none). |
+| `--pop N` | `3` | Maximum subjects lifted out over neighbors. Quality-gated, so it pops fewer or none (`0` = never). |
+| `--pop-threshold F` | `0.25` | Minimum "tastefulness" score for a subject to pop; higher = more selective. |
+| `--color-strength F` | `0.5` | How strongly photos are graded toward a shared look, `0`-`1`. |
 | `--model NAME` | `birefnet-general-lite` | rembg segmentation model. |
 | `--no-cutout` | off | Skip the AI cutouts entirely; plain overlapping collage. |
+| `--no-faces` | off | Skip face detection; frame on the rembg subject only. |
+| `--no-color` | off | Skip color cohesion grading. |
 | `--hero-boost F` | `1.5` | Extra space a lone photo gets (`1.0` = none). |
 | `--order {random,name,date}` | `random` | Order photos are placed in. |
 | `--seed N` | random | Random seed, for a reproducible result. |
@@ -70,9 +75,11 @@ python collage.py --ratio 1:1 --no-cutout
 
 ## How it works
 
-1. **Cutouts.** rembg separates the subject from the background in each photo, and the mask is cleaned up (largest blob kept, edges softened).
-2. **Layout.** A recursive "guillotine" search slices the canvas into one cell per photo, choosing the slicing that best fits each cell's shape to its subject. It is asymmetric on purpose: cutting a photo's sides (where faces sit) is penalized harder than cutting top or bottom.
-3. **Composite.** Cells are oversized and jittered so photos overlap, then painted back to front. Each photo paints around any subject already placed, so no face is ever covered. Finally one subject is lifted on top with a shadow.
+1. **Color.** Every photo is graded toward the set's average tone (a perceptual LAB match), blended subtly so the collage feels cohesive without looking heavily filtered.
+2. **Cutouts.** rembg separates the subject from the background in each photo, and the mask is cleaned up (largest blob kept, edges softened).
+3. **Faces.** InsightFace finds the faces, drops distant background-crowd faces (by size and by whether they sit on the cutout subject), and builds a "must-stay-in-frame" region per photo.
+4. **Layout.** A recursive "guillotine" search slices the canvas into one cell per photo, choosing the slicing that best fits each cell's shape to that face region. It is asymmetric on purpose: cutting a photo's sides (where faces sit) is penalized harder than cutting top or bottom.
+5. **Composite.** Cells are oversized and jittered so photos overlap, then painted back to front. Each photo paints around any subject already placed, so no face is ever covered. Finally, subjects that score highly enough (clean, well-sized, sitting over an overlap, ideally a person) are lifted on top with a shadow — zero, one, or a few depending on how many genuinely earn it.
 
 ## Notes
 

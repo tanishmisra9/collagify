@@ -20,16 +20,20 @@ THE PIPELINE (the order things happen)
 ================================================================================
 1. Find the image files in the folder.                          -> find_images
 2. Open them, fix sideways-phone rotation, put them in order.    -> load_images
-3. Use an AI model (rembg) to "cut out" the subject in each      -> subject_cutout
+3. Color-grade all photos toward one shared look, so a set shot  -> unify_colors
+   in different lighting feels like one cohesive piece.
+4. Detect faces in each photo, so framing and layout can keep    -> detect_faces
+   every face fully in view.
+5. Use an AI model (rembg) to "cut out" the subject in each      -> subject_cutout
    photo (separate the person/object from the background).
-4. Plan an invisible grid ("skeleton") that gives each photo a   -> layout_cells
-   cell shaped to fit its subject.
-5. Composite (paste) everything onto one canvas:                 -> build_collage
+6. Plan an invisible grid ("skeleton") that gives each photo a   -> layout_cells
+   cell shaped to fit its subject/faces.
+7. Composite (paste) everything onto one canvas:                 -> build_collage
    - oversize + jitter the cells so photos overlap a little,
    - paint photo backgrounds back-to-front WITHOUT covering any
      subject that's already there,
    - lift ONE subject on top with a shadow ("the pop").
-6. Save the finished image to disk.                              -> main
+8. Save the finished image to disk.                              -> main
 
 ================================================================================
 GLOSSARY (terms used all over this file)
@@ -109,12 +113,23 @@ def parse_args():
                          "(1.0 = no overlap; default: 1.1)")
     p.add_argument("--scatter", type=float, default=0.15,
                     help="How much photos are jittered off-grid, 0-1 (default: 0.15)")
-    p.add_argument("--pop", type=int, default=1,
-                    help="Max number of subjects that pop out over neighbors (0 = none; default: 1)")
+    p.add_argument("--pop", type=int, default=3,
+                    help="Maximum subjects that pop out over neighbors. Quality-gated, "
+                         "so it may pop fewer or none (0 = never; default: 3)")
+    p.add_argument("--pop-threshold", type=float, default=0.25,
+                    help="Minimum tastefulness score for a subject to pop, higher = "
+                         "more selective (default: 0.25)")
     p.add_argument("--model", default="birefnet-general-lite",
                     help="rembg segmentation model (default: birefnet-general-lite)")
     p.add_argument("--no-cutout", action="store_true",
                     help="Skip rembg subject cutouts entirely; plain overlap only")
+    p.add_argument("--color-strength", type=float, default=0.5,
+                    help="How strongly photos are graded toward a shared look, 0-1 "
+                         "(0 = off, 1 = full match; default: 0.5)")
+    p.add_argument("--no-color", action="store_true",
+                    help="Skip color cohesion grading entirely")
+    p.add_argument("--no-faces", action="store_true",
+                    help="Skip face detection; frame on the rembg subject only")
     p.add_argument("--hero-boost", type=float, default=1.5,
                     help="How much extra space single-image branches get, 1.0 = no boost (default: 1.5)")
     p.add_argument("--order", choices=["random", "name", "date"], default="random",
@@ -123,8 +138,8 @@ def parse_args():
                     help="Random seed, for a reproducible layout")
     p.add_argument("--recursive", action="store_true",
                     help="Also search subdirectories of input-dir")
-    p.add_argument("--quality", type=int, default=92,
-                    help="JPEG output quality 1-100 (default: 92)")
+    p.add_argument("--quality", type=int, default=100,
+                    help="JPEG output quality 1-100 (default: 100)")
     return p.parse_args()
 
 
@@ -203,6 +218,242 @@ def parse_ratio(ratio_str):
         return float(w) / float(h)
     except Exception:
         raise ValueError(f"Invalid --ratio '{ratio_str}', expected format like 4:5")
+
+
+# ===========================================================================
+# COLOR COHESION
+#
+# Photos shot in different lighting (warm indoor vs. cool outdoor) clash and the
+# collage looks like a pile of unrelated pictures. unify_colors nudges every
+# photo toward ONE shared look so the set feels intentional — like one roll of
+# film. We use "Reinhard color transfer," the standard technique: match each
+# photo's color statistics (average + spread) to the whole set's average.
+# ===========================================================================
+
+def unify_colors(images, strength):
+    """Grade every photo toward the set's average color/brightness and return a new
+    list of (path, graded image). `strength` is 0-1: 0 returns the photos
+    unchanged, 1 fully matches them to the shared target, values in between blend.
+
+    Why LAB color space (not plain RGB): LAB separates lightness (L) from the two
+    color axes (a = green<->red, b = blue<->yellow). Matching statistics there
+    shifts color and exposure in a way that looks natural to the eye, instead of
+    tinting the RGB channels independently (which can produce ugly casts).
+
+    How (Reinhard transfer):
+      1. Convert each photo to LAB and record its per-channel mean and standard
+         deviation (std = how spread out / contrasty that channel is).
+      2. The shared TARGET is the average of all photos' means and stds — the
+         "middle" look of the whole set.
+      3. For each photo and each channel: subtract the photo's own mean, rescale
+         by (target_std / photo_std) so its contrast matches the target, then add
+         the target mean. That recenters and rescales the photo onto the shared
+         look.
+      4. Blend the result with the original by `strength` so the effect stays
+         tasteful rather than flattening every photo to identical color.
+
+    Edge cases:
+      - strength <= 0, or fewer than 2 photos: nothing to unify, return as-is.
+      - A near-flat channel has std ≈ 0 (e.g. a solid-color photo); dividing by it
+        would blow up, so we guard with a small floor (1e-5) on the photo's std.
+      - We clip back into the valid 0-255 range before converting LAB->RGB, since
+        the rescale can push values slightly out of range.
+    """
+    if strength <= 0 or len(images) < 2:
+        return images
+
+    import cv2  # imported here so the rest of the program runs without OpenCV
+
+    # Convert each photo to LAB once, as float32 for accurate math.
+    labs = []
+    stats = []  # (mean, std) per photo, each a length-3 array over L,a,b
+    for _, img in images:
+        rgb = np.asarray(img, dtype=np.uint8)
+        lab = cv2.cvtColor(rgb, cv2.COLOR_RGB2LAB).astype(np.float32)
+        labs.append(lab)
+        # axis=(0,1) averages over all pixels, leaving one number per channel.
+        stats.append((lab.mean(axis=(0, 1)), lab.std(axis=(0, 1))))
+
+    # Shared target = the set's average mean and average spread.
+    target_mean = np.mean([m for m, _ in stats], axis=0)
+    target_std = np.mean([s for _, s in stats], axis=0)
+
+    out = []
+    for (path, img), lab, (mean, std) in zip(images, labs, stats):
+        safe_std = np.maximum(std, 1e-5)                 # never divide by ~0
+        graded = (lab - mean) * (target_std / safe_std) + target_mean
+        # Blend graded vs. original by strength, then clip to the legal LAB range.
+        blended = lab * (1 - strength) + graded * strength
+        blended = np.clip(blended, 0, 255).astype(np.uint8)
+        rgb = cv2.cvtColor(blended, cv2.COLOR_LAB2RGB)
+        out.append((path, Image.fromarray(rgb, "RGB")))
+    return out
+
+
+# ===========================================================================
+# FACE DETECTION
+#
+# rembg tells us where the whole subject is, but not specifically where FACES
+# are. detect_faces uses InsightFace's SCRFD model (state-of-the-art accuracy) to
+# find every face, so the layout can give group photos wide-enough cells and the
+# crop can guarantee faces stay in view. Faces are the thing a viewer cares about
+# most, so this is the highest-value signal for framing.
+# ===========================================================================
+
+# We build the detector once and reuse it (loading the model is slow). This
+# module-level holder caches it after the first call.
+_FACE_APP = None
+
+
+def _face_app():
+    """Create (once) and return the InsightFace detector, or None if it can't load.
+
+    Returns None on any failure (package missing, model download blocked, etc.) so
+    the caller can simply fall back to subject-based framing — face detection is an
+    enhancement, never a hard requirement.
+    """
+    global _FACE_APP
+    if _FACE_APP is None:
+        try:
+            from insightface.app import FaceAnalysis
+            # allowed_modules=['detection'] loads ONLY the face-finder (we don't
+            # need landmarks/recognition), which is faster and lighter.
+            app = FaceAnalysis(allowed_modules=["detection"],
+                               providers=["CPUExecutionProvider"])
+            # ctx_id=-1 means CPU; det_size is the internal working resolution.
+            app.prepare(ctx_id=-1, det_size=(640, 640))
+            _FACE_APP = app
+        except Exception as e:
+            print(f"  ! face detection unavailable ({e}); framing on subject only",
+                  file=sys.stderr)
+            _FACE_APP = False  # remember the failure so we don't retry every photo
+    return _FACE_APP or None
+
+
+def detect_faces(img, min_score=0.5, min_rel_area=0.18):
+    """Return a list of the MAIN face boxes in `img`, each as (x0, y0, x1, y1)
+    normalized to 0-1 (fractions of the image), or an empty list if none /
+    detector unavailable.
+
+    Normalizing to 0-1 makes the boxes independent of the photo's pixel size, so
+    they combine cleanly with the rembg subject box (also 0-1) downstream.
+
+    Why BGR: OpenCV and InsightFace expect Blue-Green-Red channel order, but Pillow
+    gives Red-Green-Blue, so we reverse the last axis ([:, :, ::-1]).
+
+    Two filters keep us focused on the people the photo is actually ABOUT, not the
+    crowd behind them (a real problem: a graduation shot found 9 faces, mostly
+    background strangers, which would drag the "keep in frame" box across the whole
+    image and frame on the crowd):
+      - min_score: drop low-confidence detections (det_score below ~0.5).
+      - min_rel_area: drop any face much smaller than the biggest one. Distant
+        background faces are tiny; foreground subjects are large. We keep faces
+        whose area is at least `min_rel_area` (18%) of the largest face's area, so
+        a foreground group stays and the far-away crowd is dropped.
+
+    Edge cases: any detector error returns [] (treated as "no faces" -> we fall
+    back to the subject box). Boxes are clamped into [0,1]. A single face is always
+    kept (it is its own largest).
+    """
+    app = _face_app()
+    if app is None:
+        return []
+    try:
+        bgr = np.asarray(img.convert("RGB"))[:, :, ::-1]
+        iw, ih = img.width, img.height
+        # Collect (area, normalized-box) for each confident detection.
+        found = []
+        for f in app.get(bgr):
+            if float(f.det_score) < min_score:
+                continue
+            x0, y0, x1, y1 = f.bbox
+            box = (max(0.0, min(1.0, x0 / iw)), max(0.0, min(1.0, y0 / ih)),
+                   max(0.0, min(1.0, x1 / iw)), max(0.0, min(1.0, y1 / ih)))
+            area = max(0.0, box[2] - box[0]) * max(0.0, box[3] - box[1])
+            if area > 0:
+                found.append((area, box))
+        if not found:
+            return []
+        # Keep only faces comparable in size to the largest (drop distant crowd).
+        biggest = max(a for a, _ in found)
+        return [box for a, box in found if a >= biggest * min_rel_area]
+    except Exception as e:
+        print(f"  ! face detection failed: {e}", file=sys.stderr)
+        return []
+
+
+def _faces_on_subject(faces, cut):
+    """Keep only the faces that sit on the rembg foreground subject.
+
+    Why: even after size-filtering, a photo can have background-crowd faces nearly
+    as big as the main people (e.g. a graduation shot with a dense crowd behind).
+    But rembg already separated foreground from background — so a face that belongs
+    to a MAIN subject lands on the cutout silhouette, while a background face lands
+    on the (removed) background. We sample the subject mask at each face's center
+    and keep the face only if that point is part of the subject.
+
+    `cut.mask` is the subject's alpha as a full-resolution "L" image (0-255). We
+    map a normalized face center to a mask pixel and keep the face if alpha > 96.
+
+    rembg keeps only its single largest blob, so in a photo with two foreground
+    people who aren't touching it may include just one — which would drop the
+    other person's face. To recover that case we ALSO keep any face that is at
+    least 55% the size of the largest on-subject face: a genuine second foreground
+    person has a similarly large face, while background-crowd faces are smaller
+    (and were already thinned by detect_faces's size filter).
+
+    If there is no cutout, we can't tell foreground from background, so we keep all
+    faces unchanged. If nothing lands on the subject at all (e.g. rembg picked a
+    different subject than the face detector), we keep the original faces rather
+    than end up with nothing.
+    """
+    if cut is None or not faces:
+        return faces
+    mw, mh = cut.mask.width, cut.mask.height
+
+    def area(f):
+        return max(0.0, f[2] - f[0]) * max(0.0, f[3] - f[1])
+
+    on_subject = []
+    for f in faces:
+        cx = min(mw - 1, int((f[0] + f[2]) / 2 * mw))
+        cy = min(mh - 1, int((f[1] + f[3]) / 2 * mh))
+        if cut.mask.getpixel((cx, cy)) > 96:
+            on_subject.append(f)
+    if not on_subject:
+        return faces
+
+    # Recover off-subject faces that are nearly as big as the biggest kept face.
+    threshold = max(area(f) for f in on_subject) * 0.55
+    kept = [f for f in faces if f in on_subject or area(f) >= threshold]
+    return kept
+
+
+def keep_box(faces, cut, margin=0.06):
+    """Combine face boxes (and the subject box, if any) into a single "must-stay-in-
+    frame" box, returned as (x0, y0, x1, y1) in 0-1, or None.
+
+    Priority for what to protect when cropping/sizing a cell:
+      1. If faces were found: first drop any that aren't on the foreground subject
+         (_faces_on_subject), then take the bounding box enclosing the rest,
+         expanded by a small `margin` (so we keep a little room around heads, not a
+         tight crop at the hairline). This is the strongest signal.
+      2. Else if there's a rembg cutout: fall back to the subject box (`cut.bbox`).
+      3. Else: None -> the crop/layout treats it as "no preference" (center).
+
+    The margin is added then clamped to [0,1] so it never exceeds the image.
+    """
+    faces = _faces_on_subject(faces, cut)
+    if faces:
+        x0 = min(f[0] for f in faces)
+        y0 = min(f[1] for f in faces)
+        x1 = max(f[2] for f in faces)
+        y1 = max(f[3] for f in faces)
+        return (max(0.0, x0 - margin), max(0.0, y0 - margin),
+                min(1.0, x1 + margin), min(1.0, y1 + margin))
+    if cut is not None:
+        return cut.bbox
+    return None
 
 
 # ===========================================================================
@@ -395,7 +646,7 @@ def realize_layout(node, images_sorted, x0, y0, x1, y1):
             + realize_layout(right, images_sorted, x0, split_y, x1, y1))
 
 
-def cell_spec(img, cut):
+def cell_spec(img, box):
     """Describe a photo's *shape preference* for the layout, as
     (target_aspect, narrow_penalty, wide_penalty).
 
@@ -406,30 +657,29 @@ def cell_spec(img, cut):
 
       - A cell NARROWER than the photo crops the photo's LEFT/RIGHT edges. In a
         group photo, the outer people's faces live on the left and right — so
-        side-cropping is bad. narrow_penalty grows with the subject's WIDTH (sw).
+        side-cropping is bad. narrow_penalty grows with the keep-region's WIDTH.
       - A cell WIDER than the photo crops the TOP/BOTTOM. That's usually sky,
-        floor, or torsos — less bad. wide_penalty grows with the subject's
-        HEIGHT (sh).
+        floor, or torsos — less bad. wide_penalty grows with its HEIGHT.
 
-    The subject's width/height come from the cutout's bounding box (`cut.bbox`,
-    normalized 0-1). We multiply the narrow penalty by 1.6 to lean even harder
-    against slicing faces — that's the fix that finally kept a wide two-person
-    selfie from getting one person chopped off: it makes such a photo strongly
-    prefer a WIDE cell.
+    `box` is the "must-stay-in-frame" region in 0-1 coords (from keep_box: the
+    faces if any, else the rembg subject). A wide two-/three-face photo therefore
+    has a wide box -> a large narrow_penalty -> the layout strongly prefers a WIDE
+    cell so nobody gets chopped. The narrow penalty is multiplied by 1.6 to lean
+    even harder against slicing the sides (where outer faces sit).
 
     Edge cases:
-      - cut is None (no cutout for this photo, e.g. --no-cutout, or rembg failed):
-        we have no subject info, so we fall back to symmetric penalties (1.0, 1.0)
-        and just match the image's own aspect.
-      - max(0.4, ...) keeps a minimum penalty so even a tiny subject still nudges
+      - box is None (no faces and no cutout, e.g. --no-cutout on an object photo):
+        we have no region to protect, so we fall back to symmetric penalties
+        (1.0, 1.0) and just match the image's own aspect.
+      - max(0.4, ...) keeps a minimum penalty so even a tiny region still nudges
         the layout (and avoids a zero penalty that the cost search would ignore).
     """
     a = aspect_ratio(img)
-    if cut is None:
+    if box is None:
         return (a, 1.0, 1.0)
-    sw = cut.bbox[2] - cut.bbox[0]   # subject width fraction  (right - left)
-    sh = cut.bbox[3] - cut.bbox[1]   # subject height fraction (bottom - top)
-    return (a, max(0.4, sw * 1.6), max(0.4, sh))
+    bw = box[2] - box[0]   # keep-region width fraction  (right - left)
+    bh = box[3] - box[1]   # keep-region height fraction (bottom - top)
+    return (a, max(0.4, bw * 1.6), max(0.4, bh))
 
 
 def leaf_cost(rect_aspect, spec):
@@ -453,16 +703,17 @@ def leaf_cost(rect_aspect, spec):
     return narrow_w * -d if d < 0 else wide_w * d
 
 
-def layout_cells(images, width, height, rng, boost, cutouts=None):
+def layout_cells(images, width, height, rng, boost, keep_boxes=None):
     """Produce the final skeleton: a list of cells [(path, img, x0,y0,x1,y1), ...]
-    that tile the whole canvas, each shaped to fit its photo's subject.
+    that tile the whole canvas, each shaped to fit its photo's keep-region.
 
     Steps:
       - If there's only ONE photo, it simply fills the entire canvas (no slicing
         needed). This is an important edge case — the search below assumes 2+.
       - Build a `spec` (shape preference) for each photo via cell_spec, looking up
-        its cutout in `cutouts` (a dict keyed by the file path as text). `cutouts`
-        may be None (when --no-cutout); then specs fall back to image aspect.
+        its keep-box in `keep_boxes` (a dict keyed by the file path as text). A
+        keep-box is the face region if faces were found, else the rembg subject,
+        else None. `keep_boxes` may be None; then specs fall back to image aspect.
       - Sort the photos by their target aspect. Sorting groups similar shapes
         next to each other, which the guillotine search can then keep clustered
         (e.g. all the tall photos in one column). plan_layout splits *contiguous*
@@ -470,10 +721,10 @@ def layout_cells(images, width, height, rng, boost, cutouts=None):
       - "Best-of-N": plan_layout already finds a near-best plan, but its random
         tie-breaking means different runs find different near-best plans. So we
         run it 8 times (each consuming the rng a little differently) and keep the
-        one with the lowest cost — the tightest subject fit. This makes the
-        *quality* consistent run to run, while a different --seed still explores a
-        different set of candidates (so you still get variety). The `{}` passed as
-        `memo` is a fresh empty cache for each attempt.
+        one with the lowest cost — the tightest fit. This makes the *quality*
+        consistent run to run, while a different --seed still explores a different
+        set of candidates (so you still get variety). The `{}` passed as `memo` is
+        a fresh empty cache for each attempt.
       - Finally, realize_layout turns the winning plan into real pixel rectangles.
     """
     n = len(images)
@@ -483,7 +734,7 @@ def layout_cells(images, width, height, rng, boost, cutouts=None):
 
     def spec_of(item):
         path, img = item
-        return cell_spec(img, cutouts.get(str(path)) if cutouts else None)
+        return cell_spec(img, keep_boxes.get(str(path)) if keep_boxes else None)
 
     items = sorted(images, key=lambda it: spec_of(it)[0])  # cluster by image aspect
     specs = [spec_of(it) for it in items]
@@ -714,13 +965,18 @@ def _footprint(mask, nw, nh, posx, posy, width, height):
     return np.asarray(layer) > 96
 
 
-def build_collage(images, width, ratio, boost, rng, overlap, scatter, cutouts, pop):
+def build_collage(images, width, ratio, boost, rng, overlap, scatter, cutouts, pop,
+                  keep_boxes=None, has_face=None, pop_threshold=0.25):
     """Assemble the final collage image and return it.
 
     This is the big one. Inputs: the loaded `images`, the canvas `width` and shape
     `ratio`, the hero `boost`, the seeded `rng`, the `overlap`/`scatter` look
-    knobs, the `cutouts` dict (path -> Cutout or None; may be None entirely), and
-    `pop` (how many subjects may be lifted on top).
+    knobs, the `cutouts` dict (path -> Cutout or None; may be None entirely),
+    `pop` (the MAXIMUM number of subjects that may be lifted on top), `keep_boxes`
+    (path -> the "must-stay-in-frame" box, faces-or-subject, used to frame crops
+    and size cells; may be None), `has_face` (path -> bool, whether a face sits on
+    that subject; used to favor people when choosing pops), and `pop_threshold`
+    (the minimum tastefulness score for a subject to pop).
 
     High-level plan:
       A. Compute the canvas height from width and ratio; make a dimmed, blurred
@@ -729,15 +985,15 @@ def build_collage(images, width, ratio, boost, rng, overlap, scatter, cutouts, p
          "placement."
       C. Precompute, for each photo, three maps: its rectangle, where its subject
          shows, and the subject's full reach if lifted on top.
-      D. Pick the ONE subject to feature ("pop"), carefully avoiding covering
-         anyone else.
+      D. Pick the subjects to feature ("pop") — quality-gated: only those that
+         clear the threshold, favoring people, never covering or clustering.
       E. Pass 1: paint photo backgrounds back-to-front, but never over a subject
          already placed (this is the no-one-gets-covered guarantee).
-      F. Pass 2: lift the featured subject on top with a soft shadow.
+      F. Pass 2: lift the featured subjects on top with a soft shadow.
     """
     # --- A. Canvas + backdrop ----------------------------------------------
     height = round(width / ratio)
-    cells = layout_cells(images, width, height, rng, boost, cutouts)
+    cells = layout_cells(images, width, height, rng, boost, keep_boxes)
 
     # Backdrop: take one photo, blow it up to cover the canvas, blur it heavily,
     # and darken it (multiply every pixel by 0.55). If jitter ever leaves a sliver
@@ -765,9 +1021,14 @@ def build_collage(images, width, ratio, boost, rng, overlap, scatter, cutouts, p
         py0 = round(cy + jy - ph / 2)
         placements.append((path, img, px0, py0, pw, ph))
 
-    # Small helper: get the Cutout for placement #idx (or None).
+    # Small helpers: get the Cutout / keep-box for placement #idx (or None).
+    # The keep-box is what crops are framed around (faces if found, else subject);
+    # cut_of gives the rembg cutout used for the pop and protected compositing.
     def cut_of(idx):
         return cutouts.get(str(placements[idx][0])) if cutouts else None
+
+    def keep_of(idx):
+        return keep_boxes.get(str(placements[idx][0])) if keep_boxes else None
 
     # Paint order, back to front: biggest cells first (so they're at the back) and
     # smaller photos painted later (on top), so a small photo isn't buried under a
@@ -788,7 +1049,10 @@ def build_collage(images, width, ratio, boost, rng, overlap, scatter, cutouts, p
         own[idx] = _rect_mask(px0, py0, pw, ph, width, height)
         cut = cut_of(idx)
         if cut is not None:
-            fnw, fnh, fl, ftop = cover_transform(img, pw, ph, cut.bbox)
+            # Place the cutout silhouette using the SAME framing transform the
+            # background will use (keep_of(idx)), so the footprint lines up with
+            # where the subject actually lands in the painted photo.
+            fnw, fnh, fl, ftop = cover_transform(img, pw, ph, keep_of(idx))
             full = _footprint(cut.mask, fnw, fnh, px0 - fl, py0 - ftop, width, height)
             # Why two versions: clipping to the rectangle (face_ft) tells us where
             # the subject is genuinely painted. Protecting pixels OUTSIDE the
@@ -798,10 +1062,12 @@ def build_collage(images, width, ratio, boost, rng, overlap, scatter, cutouts, p
             pop_ft[idx] = full
             face_ft[idx] = full & own[idx]
 
-    # --- D. Choose the single featured subject to "pop" --------------------
-    # We want a clean, nicely-sized subject that sits where it overlaps a neighbor
-    # (so lifting it reads as leaning over that neighbor) — but that won't cover
-    # anyone else's face. We score every candidate and pick the best valid one.
+    # --- D. Choose the featured subjects to "pop" --------------------------
+    # Pops are QUALITY-GATED, not a fixed count: we score every subject for how
+    # tasteful a pop it would make, then lift only those that clear a threshold
+    # (favoring people, never covering another subject, never clustering), up to
+    # `pop` as a hard ceiling. So a weak set pops nothing and a strong one pops a
+    # few — pops feel earned, never used for the sake of it.
     selected = []
     if cutouts and pop > 0:
         scored = []
@@ -834,19 +1100,37 @@ def build_collage(images, width, ratio, boost, rng, overlap, scatter, cutouts, p
             # Score combines: how clean the cutout is (isolation), how well-sized
             # the subject is (size_fit peaks when it fills ~35% of its photo — not
             # a tiny speck, not the whole frame), and how much it leans over a
-            # neighbor (seam). Higher score = better pop candidate.
+            # neighbor (seam). A face factor favors people over objects: a clean
+            # person pops more tastefully than, say, a car. Higher = better pop.
             cut = cut_of(idx)
             size_fit = max(0.0, 1.0 - abs(cut.coverage - 0.35) / 0.35)
-            score = cut.isolation * size_fit * min(1.0, seam * 4.0)
+            faced = bool(has_face and has_face.get(str(placements[idx][0])))
+            face_factor = 1.0 if faced else 0.6
+            score = cut.isolation * size_fit * min(1.0, seam * 4.0) * face_factor
             scored.append((score, collision, idx))
 
-        # Take the best-scoring candidates, but skip any that would cover more than
-        # ~6% of another subject. Stop once we've chosen `pop` of them (default 1).
-        scored.sort(reverse=True)             # highest score first
+        # Gate the candidates (highest score first). A subject pops only if it:
+        #   - clears the tastefulness threshold (else it's not worth popping),
+        #   - covers <=6% of any other subject (never hide a face), and
+        #   - doesn't overlap an already-chosen pop by much (two pops merging into
+        #     one blob looks cluttered, not deliberate).
+        # We stop at `pop` as a hard ceiling.
+        scored.sort(reverse=True)
         for score, collision, idx in scored:
-            if len(selected) >= pop or score <= 0:
+            if len(selected) >= pop or score < pop_threshold:
                 break
-            if collision <= 0.06:
+            if collision > 0.06:
+                continue
+            # Spatial spread: skip if this pop's reach overlaps a chosen pop's
+            # reach beyond 15% of the smaller of the two footprints.
+            clutter = False
+            for j in selected:
+                inter = int((pop_ft[idx] & pop_ft[j]).sum())
+                smaller = min(int(pop_ft[idx].sum()), int(pop_ft[j].sum()))
+                if smaller > 0 and inter / smaller > 0.15:
+                    clutter = True
+                    break
+            if not clutter:
                 selected.append(idx)
 
     # Friendly log line so you can see which photo (if any) got the pop.
@@ -863,8 +1147,9 @@ def build_collage(images, width, ratio, boost, rng, overlap, scatter, cutouts, p
     protected = np.zeros((height, width), dtype=bool)
     for idx in order:
         path, img, px0, py0, pw, ph = placements[idx]
-        cut = cut_of(idx)
-        bg = subject_cover_crop(img, pw, ph, cut.bbox if cut else None)
+        # Frame the crop around the keep-box (faces if found, else subject, else
+        # centered) so faces are kept in view, not sliced at the cell edge.
+        bg = subject_cover_crop(img, pw, ph, keep_of(idx))
         # Start with a fully-opaque (255) paste mask the size of this photo...
         mask = np.full((ph, pw), 255, dtype=np.uint8)
         # ...then punch holes (0) wherever a lower subject is protected. We only
@@ -879,15 +1164,15 @@ def build_collage(images, width, ratio, boost, rng, overlap, scatter, cutouts, p
         if idx in face_ft:
             protected |= face_ft[idx]
 
-    # --- F. Pass 2: lift the featured subject on top with a soft shadow -----
+    # --- F. Pass 2: lift the featured subjects on top with a soft shadow ----
     for idx in order:
         if idx not in selected:
             continue
         path, img, px0, py0, pw, ph = placements[idx]
         cut = cut_of(idx)
-        # Use the SAME transform as this photo's background so the lifted cutout
-        # lands exactly over where the subject already is (no double image).
-        fnw, fnh, fl, ftop = cover_transform(img, pw, ph, cut.bbox)
+        # Use the SAME transform as this photo's background (keep_of(idx)) so the
+        # lifted cutout lands exactly over where the subject already is.
+        fnw, fnh, fl, ftop = cover_transform(img, pw, ph, keep_of(idx))
         sub = cut.rgba.resize((fnw, fnh), Image.LANCZOS)
         x, y = px0 - fl, py0 - ftop
         # Shadow: a black copy shaped like the subject's alpha, blurred and made
@@ -934,12 +1219,18 @@ def main():
          not given it's None, which means "truly random each run."
       5. Load the images; if none could be opened, error and exit.
       6. Parse the canvas ratio; on a bad value, print the message and exit.
-      7. Unless --no-cutout: load the rembg model ONCE (new_session) and run the
+      7. Unless --no-color: grade every photo toward one shared look (unify_colors)
+         so the set feels cohesive. This happens BEFORE cutouts/faces so the graded
+         pixels flow into everything downstream.
+      8. Unless --no-cutout: load the rembg model ONCE (new_session) and run the
          cutout on every photo, storing results in `cutouts` keyed by file path.
          If rembg isn't installed or the model fails to load, we warn and fall
          back to cutouts = None (the collage still works, just with no AI cutouts).
-      8. Build the collage.
-      9. Pick a non-clobbering output path, make sure its folder exists
+      9. Build `keep_boxes` (path -> must-stay-in-frame region): detect faces in
+         each photo (unless --no-faces) and combine with the subject box. This is
+         what framing and cell-sizing use to keep faces in view.
+     10. Build the collage.
+     11. Pick a non-clobbering output path, make sure its folder exists
          (mkdir parents=True), and save. We only pass JPEG `quality` when the
          output is actually a .jpg/.jpeg.
     Each `sys.exit(1)` ends the program with a non-zero status (the convention for
@@ -970,6 +1261,16 @@ def main():
         print(str(e), file=sys.stderr)
         sys.exit(1)
 
+    # Color cohesion: grade all photos toward a shared look first, so cutouts and
+    # the backdrop all inherit the same grade. Failures (e.g. OpenCV missing)
+    # degrade to ungraded rather than stopping the run.
+    if not args.no_color:
+        try:
+            images = unify_colors(images, args.color_strength)
+        except Exception as e:
+            print(f"  ! color cohesion unavailable ({e}); using original colors",
+                  file=sys.stderr)
+
     # Run the AI cutout on each photo (unless disabled). One shared `session`
     # avoids reloading the ~200MB model per image. Any failure here degrades
     # gracefully to "no cutouts" rather than stopping the program.
@@ -988,6 +1289,23 @@ def main():
                   file=sys.stderr)
             cutouts = None
 
+    # Build the keep-box for every photo: the region that must stay in frame. We
+    # detect faces (unless --no-faces) and combine them with the subject box via
+    # keep_box(). Computed for ALL photos so face-aware framing works even with
+    # --no-cutout. Faces are detected on the (graded) images loaded above. We also
+    # record `has_face` (a face sits on the subject) so pop selection can favor
+    # people over objects.
+    keep_boxes = {}
+    has_face = {}
+    for path, img in images:
+        faces = [] if args.no_faces else detect_faces(img)
+        cut = cutouts.get(str(path)) if cutouts else None
+        on_subject = _faces_on_subject(faces, cut) if faces else []
+        keep_boxes[str(path)] = keep_box(faces, cut)
+        has_face[str(path)] = bool(on_subject)
+        if faces:
+            print(f"  faces {path.name}: {len(on_subject)}/{len(faces)} on subject")
+
     collage = build_collage(
         images=images,
         width=args.width,
@@ -998,6 +1316,9 @@ def main():
         scatter=args.scatter,
         cutouts=cutouts,
         pop=args.pop,
+        keep_boxes=keep_boxes,
+        has_face=has_face,
+        pop_threshold=args.pop_threshold,
     )
 
     out_path = resolve_output_path(Path(args.output))
